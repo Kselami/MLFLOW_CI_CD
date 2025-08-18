@@ -12,7 +12,7 @@ jobs:
       run:
         shell: powershell
     env:
-      # valeurs par défaut (seront remplacées par la sélection de port dynamique)
+      # Valeurs par défaut (seront mises à jour après sélection dynamique du port)
       MLFLOW_TRACKING_URI: http://127.0.0.1:5000
       MLFLOW_DB_URI: sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db
       MLFLOW_ARTIFACTS_DIR: C:/mlflow-data/tp-mlflow-automation/artifacts
@@ -21,34 +21,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # Résout un interpréteur Python fiable sur la machine (priorité au Python système)
+      - name: Resolve Python on runner
+        run: |
+          $py = $null
+          try {
+            $exe = & py -3 -c "import sys;print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $exe) { $py = $exe.Trim() }
+          } catch {}
+          if (-not $py) {
+            $cand = @(
+              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+              "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+              "C:\Python311\python.exe",
+              "C:\Python312\python.exe"
+            ) | Where-Object { Test-Path $_ }
+            if ($cand.Count -gt 0) { $py = $cand[0] }
+          }
+          if (-not $py) {
+            if ($env:PythonLocation) {
+              $py = Join-Path $env:PythonLocation 'python.exe'
+            }
+          }
+          if (-not $py -or -not (Test-Path $py)) {
+            throw "Aucun python fiable trouvé. Installe Python 3.11 sur le runner ou fournis un chemin."
+          }
+          "PY_EXE=$py" | Out-File -Append -FilePath $env:GITHUB_ENV
+          Write-Host "Using Python: $py"
+          & $py -c "import sys; print(sys.version); print(sys.executable)"
 
-      - name: Bootstrap pip (force, no assumptions)
+      # Bootstrap pip (sans Start-Process, erreurs visibles)
+      - name: Bootstrap pip (system python)
         run: |
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
-          $py = Join-Path $env:PythonLocation 'python.exe'
-          Write-Host "Using Python: $py"
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-          $gp = "get-pip.py"
-          if (Test-Path $gp) { Remove-Item $gp -Force }
-          Invoke-WebRequest -UseBasicParsing -Uri https://bootstrap.pypa.io/get-pip.py -OutFile $gp -ErrorAction Stop
-          $p = Start-Process -FilePath $py -ArgumentList $gp -PassThru -Wait
-          if ($p.ExitCode -ne 0) { throw "pip bootstrap failed: $($p.ExitCode)" }
+          $py = $env:PY_EXE
+          $pipOK = $true
+          try { & $py -m pip --version } catch { $pipOK = $false }
+          if (-not $pipOK) {
+            try {
+              & $py -m ensurepip --upgrade
+            } catch {
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+              $gp = "get-pip.py"
+              if (Test-Path $gp) { Remove-Item $gp -Force }
+              Invoke-WebRequest -UseBasicParsing -Uri https://bootstrap.pypa.io/get-pip.py -OutFile $gp -ErrorAction Stop
+              & $py $gp
+            }
+          }
           & $py -m pip --version
           & $py -m pip install --upgrade pip setuptools wheel
 
       - name: Install deps
         run: |
-          $py = Join-Path $env:PythonLocation 'python.exe'
+          $py = $env:PY_EXE
           if (Test-Path requirements.txt) { & $py -m pip install -r requirements.txt }
           & $py -m pip install "mlflow>=2.8,<3" requests pytest
 
       - name: Verify Python & mlflow
         run: |
-          $py = Join-Path $env:PythonLocation 'python.exe'
+          $py = $env:PY_EXE
           & $py -c "import sys, mlflow; print(sys.executable); print('mlflow', mlflow.__version__)"
 
       - name: Pick a free port and export MLFLOW_TRACKING_URI
@@ -56,6 +87,136 @@ jobs:
           $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
           $listener.Start()
           $port = ($listener.LocalEndpoint).Port
+          $listener.Stop()
+          "MLFLOW_PORT=$port" | Out-File -Append -FilePath $env:GITHUB_ENV
+          "MLFLOW_TRACKING_URI=http://127.0.0.1:$port" | Out-File -Append -FilePath $env:GITHUB_ENV
+          Write-Host "Selected free port: $port"
+
+      - name: Ensure MLflow server running (robust)
+        run: |
+          $py = $env:PY_EXE
+
+          # Dossiers
+          New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
+          New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
+
+          # Windows path -> file:/// URI
+          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
+          $artUri = ($art -notmatch '^file:') ? ("file:///$art") : $art
+
+          $port = [int]$env:MLFLOW_PORT
+          $out = "mlflow-server.out"
+          $err = "mlflow-server.err"
+          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+
+          $args = @(
+            "-m","mlflow","server",
+            "--backend-store-uri",$env:MLFLOW_DB_URI,
+            "--serve-artifacts",
+            "--artifacts-destination",$artUri,
+            "--host","127.0.0.1","--port",$port
+          )
+
+          # Démarrage direct (pas de Start-Process) pour récupérer le code si crash immédiat
+          $job = Start-Job -ScriptBlock {
+            param($py,$args,$out,$err)
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $py
+            $psi.Arguments = ($args -join ' ')
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.UseShellExecute = $false
+            $p = New-Object System.Diagnostics.Process
+            $p.StartInfo = $psi
+            $null = $p.Start()
+            $p.StandardOutput.ReadToEnd() | Out-File -FilePath $out -Encoding utf8
+            $p.StandardError.ReadToEnd()  | Out-File -FilePath $err -Encoding utf8
+            $p.WaitForExit()
+            return $p.ExitCode
+          } -ArgumentList $py,$args,$out,$err
+
+          # Attendre qu'il écoute/serve
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+              if ($tcp -and $tcp.State -in @('Listen','Established')) {
+                Invoke-WebRequest -Uri "http://127.0.0.1:$port" -TimeoutSec 2 | Out-Null
+                $ok = $true; break
+              }
+            } catch {}
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ok) {
+            Write-Host "=== mlflow-server.err (tail) ==="
+            Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+            Write-Host "=== mlflow-server.out (tail) ==="
+            Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+            $exit = Receive-Job $job -ErrorAction SilentlyContinue
+            Write-Host "mlflow server exit code (if finished): $exit"
+            throw "MLflow server did not become ready on 127.0.0.1:$port"
+          } else {
+            Write-Host "MLflow is up on 127.0.0.1:$port"
+          }
+
+      - name: Smoke check MLflow (requests, retry)
+        run: |
+          $py = $env:PY_EXE
+          Set-Content -LiteralPath smoke.py -Value @'
+          import os, time, requests
+          url = os.environ["MLFLOW_TRACKING_URI"]
+          for i in range(10):
+              try:
+                  r = requests.get(url, timeout=2)
+                  print("MLflow UI reachable:", r.status_code)
+                  break
+              except Exception as e:
+                  print("retry", i+1, ":", e)
+                  time.sleep(1.5)
+          else:
+              raise SystemExit("Smoke check failed")
+          '@
+          & $py smoke.py
+
+      - name: Run tests
+        run: |
+          $py = $env:PY_EXE
+          & $py -m pytest -q
+
+      - name: Train and log model (to your local MLflow)
+        run: |
+          $py = $env:PY_EXE
+          & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
+
+      - name: Show top runs (from local MLflow)
+        run: |
+          $py = $env:PY_EXE
+          Set-Content -LiteralPath show_runs.py -Value @'
+          import os, mlflow
+          from mlflow.tracking import MlflowClient
+
+          print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
+          c = MlflowClient()
+          exps = {e.name: e.experiment_id for e in c.search_experiments()}
+          eid = exps.get("ci-experiment")
+          if eid:
+              runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
+              for r in runs:
+                  print(r.info.run_id, r.data.metrics.get("accuracy"))
+          else:
+              print("Experiment 'ci-experiment' not found")
+          '@
+          & $py show_runs.py
+
+      - name: Dump MLflow server logs on failure
+        if: failure()
+        run: |
+          Write-Host "=== mlflow-server.err (tail) ==="
+          Get-Content -LiteralPath mlflow-server.err -Tail 200 -ErrorAction SilentlyContinue
+          Write-Host "=== mlflow-server.out (tail) ==="
+          Get-Content -LiteralPath mlflow-server.out -Tail 200 -ErrorAction SilentlyContinue
+
 
 
 
