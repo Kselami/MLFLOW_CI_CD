@@ -25,11 +25,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install deps (in Actions Python)
         run: |
-          python -m pip install --upgrade pip
-          if (Test-Path requirements.txt) { pip install -r requirements.txt }
-          pip install "mlflow>=2.8,<3" requests pytest
+          & "$env:PythonLocation\python.exe" -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { & "$env:PythonLocation\python.exe" -m pip install -r requirements.txt }
+          & "$env:PythonLocation\python.exe" -m pip install "mlflow>=2.8,<3" requests pytest
 
       - name: Verify Python & mlflow
         run: |
@@ -38,16 +38,19 @@ jobs:
 
       - name: Ensure MLflow server running (local & persistent)
         run: |
-          # Prépare les dossiers
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
-          # Convertit chemin Windows -> URI file:///
+          # Windows path -> file:/// URI
           $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
           if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
 
           $port = 5000
-          $ok = $false
+          $out = "mlflow-server.out"
+          $err = "mlflow-server.err"
+          if (Test-Path $out) { Remove-Item $out -Force }
+          if (Test-Path $err) { Remove-Item $err -Force }
+
           $py = Join-Path $env:PythonLocation 'python.exe'
           $args = @(
             "-m","mlflow","server",
@@ -56,17 +59,11 @@ jobs:
             "--host","127.0.0.1","--port",$port
           )
 
-          # Nettoie anciens logs
-          $out = "mlflow-server.out"
-          $err = "mlflow-server.err"
-          if (Test-Path $out) { Remove-Item $out -Force }
-          if (Test-Path $err) { Remove-Item $err -Force }
-
-          # Démarre avec le bon interpréteur (celui de actions/setup-python)
           Start-Process -FilePath $py -ArgumentList $args `
             -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
 
-          # Attend jusqu'à 120s que l'UI réponde
+          # Wait up to 120s for UI to respond
+          $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             try {
               Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
@@ -95,7 +92,7 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest -q
+          & "$env:PythonLocation\python.exe" -m pytest -q
 
       - name: Train and log model (to your local MLflow)
         run: |
@@ -118,6 +115,7 @@ jobs:
           else:
               print("Experiment 'ci-experiment' not found")
           '@
-          & "$env:PythonLocation\python.exe" show_runs.py # 
+          & "$env:PythonLocation\python.exe" show_runs.py
+
 
 
