@@ -29,29 +29,54 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
-          pip install mlflow requests pytest
+          # On force une version de MLflow qui supporte --artifacts-destination
+          pip install "mlflow>=2.8,<3" requests pytest
 
       - name: Ensure MLflow server running (local & persistent)
         run: |
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
-          $conn = Get-NetTCPConnection -LocalPort 5000 -ErrorAction SilentlyContinue
+
+          # Convertit C:\... ou C:/... en file:///C:/...
+          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
+          if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
+
+          $port = 5000
+          $conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+
           if (-not $conn) {
             $args = @(
               "-m","mlflow","server",
               "--backend-store-uri",$env:MLFLOW_DB_URI,
-              "--artifacts-destination",$env:MLFLOW_ARTIFACTS_DIR,
-              "--host","127.0.0.1","--port","5000"
+              "--artifacts-destination",$artUri,
+              "--host","127.0.0.1","--port",$port
             )
-            Start-Process -FilePath "python" -ArgumentList $args -WindowStyle Hidden
+            # Loggue tout pour diagnostic si besoin
+            $out = "mlflow-server.out"
+            $err = "mlflow-server.err"
+            if (Test-Path $out) { Remove-Item $out -Force }
+            if (Test-Path $err) { Remove-Item $err -Force }
+
+            Start-Process -FilePath "python" -ArgumentList $args `
+              -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
+
+            # Attend jusqu'à 120s avec backoff
             $ok = $false
-            for ($i = 0; $i -lt 30; $i++) {
+            for ($i = 0; $i -lt 60; $i++) {
               try {
                 Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
                 $ok = $true; break
-              } catch { Start-Sleep -Seconds 1 }
+              } catch {
+                Start-Sleep -Seconds 2
+              }
             }
-            if (-not $ok) { throw "MLflow server did not become ready on port 5000." }
+            if (-not $ok) {
+              Write-Host "=== Last 200 lines of mlflow-server.err ==="
+              Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+              Write-Host "=== Last 200 lines of mlflow-server.out ==="
+              Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+              throw "MLflow server did not become ready on port $port."
+            }
           }
 
       - name: Smoke check MLflow
@@ -87,6 +112,7 @@ jobs:
               for r in runs:
                   print(r.info.run_id, r.data.metrics.get("accuracy"))
           else:
-              print("Experiment 'ci-experiment' not found") # fghfg
+              print("Experiment 'ci-experiment' not found")
           '@
           python show_runs.py
+
