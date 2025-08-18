@@ -87,6 +87,6 @@ jobs:
               for r in runs:
                   print(r.info.run_id, r.data.metrics.get("accuracy"))
           else:
-              print("Experiment 'ci-experiment' not found")
+              print("Experiment 'ci-experiment' not found") # fghfg
           '@
           python show_runs.py
