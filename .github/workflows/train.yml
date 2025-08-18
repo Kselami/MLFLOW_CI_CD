@@ -25,30 +25,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Bootstrap pip (force, no assumptions)
+      - name: Bootstrap pip (force)
         run: |
-          # Nettoie les env vars qui cassent la stdlib
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
-
           $py = Join-Path $env:PythonLocation 'python.exe'
           Write-Host "Using Python: $py"
-          & $py -c "import sys; print(sys.version); print(sys.executable)"
-
-          # TLS moderne pour le téléchargement
+          # TLS pour download get-pip.py
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-
-          # Télécharge get-pip.py puis installe pip
           $gp = "get-pip.py"
           if (Test-Path $gp) { Remove-Item $gp -Force }
           Invoke-WebRequest -UseBasicParsing -Uri https://bootstrap.pypa.io/get-pip.py -OutFile $gp -ErrorAction Stop
-
           $p = Start-Process -FilePath $py -ArgumentList $gp -PassThru -Wait
-          if ($p.ExitCode -ne 0) {
-            Write-Host "get-pip.py failed with code $($p.ExitCode)"
-            throw "pip bootstrap failed"
-          }
-
-          # Vérif + upgrade de base
+          if ($p.ExitCode -ne 0) { throw "pip bootstrap failed: $($p.ExitCode)" }
           & $py -m pip --version
           & $py -m pip install --upgrade pip setuptools wheel
 
@@ -67,7 +55,7 @@ jobs:
         run: |
           $py  = Join-Path $env:PythonLocation 'python.exe'
 
-          # Prépare les dossiers
+          # Prépare dossiers
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
@@ -78,18 +66,18 @@ jobs:
           $port = 5000
           $out = "mlflow-server.out"
           $err = "mlflow-server.err"
-          if (Test-Path $out) { Remove-Item $out -Force }
-          if (Test-Path $err) { Remove-Item $err -Force }
+          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
 
+          # Démarre serveur MLflow avec le BON Python et loggue tout
           $args = @(
             "-m","mlflow","server",
             "--backend-store-uri",$env:MLFLOW_DB_URI,
             "--artifacts-destination",$artUri,
             "--host","127.0.0.1","--port",$port
           )
-
-          Start-Process -FilePath $py -ArgumentList $args `
-            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
+          $proc = Start-Process -FilePath $py -ArgumentList $args `
+            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
+          "MLFLOW_SERVER_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV
 
           # Attendre jusqu'à 120s que l'UI réponde
           $ok = $false
@@ -149,6 +137,17 @@ jobs:
               print("Experiment 'ci-experiment' not found")
           '@
           & $py show_runs.py
+
+      # (Optionnel) Afficher les logs serveur si un step échoue ensuite
+      - name: Dump MLflow server logs on failure
+        if: failure()
+        run: |
+          Write-Host "=== mlflow-server.err (tail) ==="
+          Get-Content -LiteralPath mlflow-server.err -Tail 200 -ErrorAction SilentlyContinue
+          Write-Host "=== mlflow-server.out (tail) ==="
+          Get-Content -LiteralPath mlflow-server.out -Tail 200 -ErrorAction SilentlyContinue
+          Write-Host "PID from env: $env:MLFLOW_SERVER_PID"
+
 
 
 
