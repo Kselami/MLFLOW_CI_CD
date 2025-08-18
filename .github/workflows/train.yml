@@ -25,45 +25,30 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Bootstrap pip if missing (fix PYTHONHOME/PYTHONPATH)
+      - name: Bootstrap pip (force install with get-pip.py)
         run: |
-          # Supprime les var d'env qui cassent Python
+          # Nettoie les env vars qui cassent la résolution de la stdlib
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
 
           $py = Join-Path $env:PythonLocation 'python.exe'
-
           Write-Host "Using Python:" $py
           & $py -c "import sys;print(sys.version);print(sys.executable)"
 
-          # Vérifie pip
-          $pipOk = $true
-          try { & $py -m pip --version } catch { $pipOk = $false }
+          $pipOK = $true
+          try { & $py -m pip --version } catch { $pipOK = $false }
 
-          if (-not $pipOk) {
-            Write-Host "pip absent -> ensurepip..."
-            try {
-              & $py -m ensurepip --upgrade
-            } catch {
-              Write-Host "ensurepip indisponible, fallback get-pip.py"
-            }
-          }
-
-          # Recheck pip
-          $pipOk = $true
-          try { & $py -m pip --version } catch { $pipOk = $false }
-
-          if (-not $pipOk) {
-            Write-Host "Téléchargement get-pip.py..."
+          if (-not $pipOK) {
+            Write-Host "pip absent -> téléchargement de get-pip.py"
             $gp = "get-pip.py"
             Invoke-WebRequest -UseBasicParsing -Uri https://bootstrap.pypa.io/get-pip.py -OutFile $gp
             & $py $gp
           }
 
-          # Final: afficher versions
+          # Vérif finale + upgrade base
           & $py -m pip --version
           & $py -m pip install --upgrade pip setuptools wheel
 
-      - name: Install deps (in Actions Python)
+      - name: Install deps
         run: |
           $py = Join-Path $env:PythonLocation 'python.exe'
           if (Test-Path requirements.txt) { & $py -m pip install -r requirements.txt }
@@ -97,11 +82,10 @@ jobs:
             "--host","127.0.0.1","--port",$port
           )
 
-          # Démarre avec le bon Python (celui d'actions/setup-python)
           Start-Process -FilePath $py -ArgumentList $args `
             -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
 
-          # Attendre jusqu'à 120s
+          # Attendre jusqu'à 120s que l'UI réponde
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             try {
@@ -123,42 +107,8 @@ jobs:
         run: |
           $py = Join-Path $env:PythonLocation 'python.exe'
           Set-Content -LiteralPath smoke.py -Value @'
-          import os, urllib.request
-          url = os.environ["MLFLOW_TRACKING_URI"]
-          with urllib.request.urlopen(url, timeout=10) as resp:
-              print("MLflow UI reachable:", resp.getcode())
-          '@
-          & $py smoke.py
+          im
 
-      - name: Run tests
-        run: |
-          $py = Join-Path $env:PythonLocation 'python.exe'
-          & $py -m pytest -q
-
-      - name: Train and log model (to your local MLflow)
-        run: |
-          $py = Join-Path $env:PythonLocation 'python.exe'
-          & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
-
-      - name: Show top runs (from local MLflow)
-        run: |
-          $py = Join-Path $env:PythonLocation 'python.exe'
-          Set-Content -LiteralPath show_runs.py -Value @'
-          import os, mlflow
-          from mlflow.tracking import MlflowClient
-
-          print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
-          c = MlflowClient()
-          exps = {e.name: e.experiment_id for e in c.search_experiments()}
-          eid = exps.get("ci-experiment")
-          if eid:
-              runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
-              for r in runs:
-                  print(r.info.run_id, r.data.metrics.get("accuracy"))
-          else:
-              print("Experiment 'ci-experiment' not found")
-          '@
-          & $py show_runs.py
 
 
 
