@@ -25,7 +25,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Crée un venv local basé sur le Python d'actions (SSL OK)
       - name: Create venv (from actions Python)
         run: |
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
@@ -46,37 +45,32 @@ jobs:
           $py = $env:VENV_PY
           & $py -c "import sys, mlflow; print(sys.executable); print('mlflow', mlflow.__version__)"
 
-      - name: Pick a free port and export MLFLOW_TRACKING_URI
+      - name: Run pipeline end-to-end (start MLflow, smoke, tests, train, show, cleanup)
         run: |
+          $py = $env:VENV_PY
+
+          # --- Préparer artefacts/DB ---
+          New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
+          New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
+
+          # Chemin Windows -> URI file:///
+          $art  = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
+          if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
+
+          # Choisir un port libre
           $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
           $listener.Start()
           $port = ($listener.LocalEndpoint).Port
           $listener.Stop()
-          "MLFLOW_PORT=$port" | Out-File -Append -FilePath $env:GITHUB_ENV
-          "MLFLOW_TRACKING_URI=http://127.0.0.1:$port" | Out-File -Append -FilePath $env:GITHUB_ENV
-          Write-Host "Selected free port: $port"
+          $env:MLFLOW_TRACKING_URI = "http://127.0.0.1:$port"
+          Write-Host "Using MLFLOW_TRACKING_URI=$($env:MLFLOW_TRACKING_URI)"
 
-      - name: Ensure MLflow server running (robust)
-        run: |
-          $py = $env:VENV_PY
-
-          # Dossiers artefacts/DB
-          New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
-          New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
-
-          # Windows path -> file:/// URI (sans opérateur ternaire)
-          $art  = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
-          if ($art -notmatch '^file:') {
-            $artUri = "file:///$art"
-          } else {
-            $artUri = $art
-          }
-
-          $port = [int]$env:MLFLOW_PORT
+          # Logs
           $out = "mlflow-server.out"
           $err = "mlflow-server.err"
           Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
 
+          # Drapeaux serveur
           $args = @(
             "-m","mlflow","server",
             "--backend-store-uri",$env:MLFLOW_DB_URI,
@@ -85,91 +79,88 @@ jobs:
             "--host","127.0.0.1","--port",$port
           )
 
+          # Démarrer MLflow et garder le process pendant toute la step
           $proc = Start-Process -FilePath $py -ArgumentList $args `
             -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
-          "MLFLOW_SERVER_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV
-          Write-Host "MLflow server PID: $($proc.Id)  Port: $port  URI: $env:MLFLOW_TRACKING_URI"
+          Write-Host "MLflow PID: $($proc.Id)"
 
-          # Attente jusqu'à 120s (port + HTTP) avec check de vie du process
-          $ok = $false
-          for ($i = 0; $i -lt 60; $i++) {
-            try {
-              if ($proc.HasExited) { break }
-              $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-              if ($tcp -and $tcp.State -in @('Listen','Established')) {
-                Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
-                $ok = $true; break
-              }
-            } catch {}
-            Start-Sleep -Seconds 2
+          try {
+            # Attendre la disponibilité (port + HTTP)
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                if ($proc.HasExited) { break }
+                $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+                if ($tcp -and $tcp.State -in @('Listen','Established')) {
+                  Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
+                  $ok = $true; break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            if (-not $ok) {
+              Write-Host "=== mlflow-server.err (tail) ==="
+              Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+              Write-Host "=== mlflow-server.out (tail) ==="
+              Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+              throw "MLflow server not ready"
+            }
+
+            # --- Smoke (requests, retry léger) ---
+            Set-Content -LiteralPath smoke.py -Value @'
+            import os, time, requests
+            url = os.environ["MLFLOW_TRACKING_URI"]
+            for i in range(10):
+                try:
+                    r = requests.get(url, timeout=2)
+                    print("MLflow UI reachable:", r.status_code)
+                    break
+                except Exception as e:
+                    print("retry", i+1, ":", e)
+                    time.sleep(1.5)
+            else:
+                raise SystemExit("Smoke check failed")
+            '@
+            & $py smoke.py
+
+            # --- Tests ---
+            & $py -m pytest -q
+
+            # --- Entraînement ---
+            & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
+
+            # --- Afficher top runs ---
+            Set-Content -LiteralPath show_runs.py -Value @'
+            import os, mlflow
+            from mlflow.tracking import MlflowClient
+
+            print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
+            c = MlflowClient()
+            exps = {e.name: e.experiment_id for e in c.search_experiments()}
+            eid = exps.get("ci-experiment")
+            if eid:
+                runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
+                for r in runs:
+                    print(r.info.run_id, r.data.metrics.get("accuracy"))
+            else:
+                print("Experiment 'ci-experiment' not found")
+            '@
+            & $py show_runs.py
           }
-          if (-not $ok) {
+          finally {
+            # Toujours montrer les logs et arrêter le serveur
             Write-Host "=== mlflow-server.err (tail) ==="
             Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
             Write-Host "=== mlflow-server.out (tail) ==="
             Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-            try { Write-Host "Process exited: $($proc.HasExited) Code: $($proc.ExitCode)" } catch {}
-            throw "MLflow server did not become ready on 127.0.0.1:$port"
-          } else {
-            Write-Host "MLflow is up on 127.0.0.1:$port"
+            try {
+              if ($proc -and -not $proc.HasExited) {
+                Stop-Process -Id $proc.Id -Force
+                Write-Host "MLflow server stopped."
+              }
+            } catch {}
           }
 
-      - name: Smoke check MLflow (requests, retry)
-        run: |
-          $py = $env:VENV_PY
-          Set-Content -LiteralPath smoke.py -Value @'
-          import os, time, requests
-          url = os.environ["MLFLOW_TRACKING_URI"]
-          for i in range(10):
-              try:
-                  r = requests.get(url, timeout=2)
-                  print("MLflow UI reachable:", r.status_code)
-                  break
-              except Exception as e:
-                  print("retry", i+1, ":", e)
-                  time.sleep(1.5)
-          else:
-              raise SystemExit("Smoke check failed")
-          '@
-          & $py smoke.py
-
-      - name: Run tests
-        run: |
-          $py = $env:VENV_PY
-          & $py -m pytest -q
-
-      - name: Train and log model (to your local MLflow)
-        run: |
-          $py = $env:VENV_PY
-          & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
-
-      - name: Show top runs (from local MLflow)
-        run: |
-          $py = $env:VENV_PY
-          Set-Content -LiteralPath show_runs.py -Value @'
-          import os, mlflow
-          from mlflow.tracking import MlflowClient
-
-          print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
-          c = MlflowClient()
-          exps = {e.name: e.experiment_id for e in c.search_experiments()}
-          eid = exps.get("ci-experiment")
-          if eid:
-              runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
-              for r in runs:
-                  print(r.info.run_id, r.data.metrics.get("accuracy"))
-          else:
-              print("Experiment 'ci-experiment' not found")
-          '@
-          & $py show_runs.py
-
-      - name: Dump MLflow server logs on failure
-        if: failure()
-        run: |
-          Write-Host "=== mlflow-server.err (tail) ==="
-          Get-Content -LiteralPath mlflow-server.err -Tail 200 -ErrorAction SilentlyContinue
-          Write-Host "=== mlflow-server.out (tail) ==="
-          Get-Content -LiteralPath mlflow-server.out -Tail 200 -ErrorAction SilentlyContinue
 
 
 
