@@ -7,7 +7,15 @@ on:
 
 jobs:
   train:
-    runs-on: ubuntu-latest
+    # Le job tourne sur TON PC (self-hosted Windows)
+    runs-on: [self-hosted, windows]
+    env:
+      # On pointe vers ton serveur local MLflow
+      MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+      # Chemins persistants sur ta machine (DB + artefacts)
+      MLFLOW_DB_URI: sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db
+      MLFLOW_ARTIFACTS_DIR: C:/mlflow-data/tp-mlflow-automation/artifacts
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,29 +30,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Start MLflow server (SQLite + artifacts)
+      - name: Ensure MLflow server running (local & persistant)
+        shell: pwsh
         run: |
-          nohup mlflow server --backend-store-uri sqlite:///mlflow.db             --artifacts-destination ./artifacts             --host 127.0.0.1 --port 5000 > mlflow_server.log 2>&1 &
-          sleep 5
+          # Crée les dossiers si besoin
+          New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
+          # Démarre le serveur s'il n'écoute pas déjà sur 5000
+          $conn = Get-NetTCPConnection -LocalPort 5000 -ErrorAction SilentlyContinue
+          if (-not $conn) {
+            Start-Process -FilePath "python" -ArgumentList "-m mlflow server --backend-store-uri $env:MLFLOW_DB_URI --artifacts-destination $env:MLFLOW_ARTIFACTS_DIR --host 127.0.0.1 --port 5000" -WindowStyle Hidden
+            Start-Sleep -Seconds 8
+          }
 
-      - name: Run tests
-        env:
-          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
-        run: pytest -q
-
-      - name: Train and log model
-        env:
-          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
-        run: |
-          python src/train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier"             --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
-
-      - name: Show top runs
-        env:
-          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+      - name: Smoke check MLflow
         run: |
           python - <<'PY'
-          import mlflow
+          import os, requests
+          r = requests.get(os.environ["MLFLOW_TRACKING_URI"])
+          print("MLflow UI reachable:", r.status_code)
+          PY
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Train and log model (to your local MLflow)
+        run: |
+          python src/train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" \
+            --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
+
+      - name: Show top runs (from local MLflow)
+        run: |
+          python - <<'PY'
+          import os, mlflow
           from mlflow.tracking import MlflowClient
+          print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
           c = MlflowClient()
           exps = {e.name: e.experiment_id for e in c.search_experiments()}
           eid = exps.get("ci-experiment")
@@ -55,3 +74,4 @@ jobs:
           else:
               print("Experiment 'ci-experiment' not found")
           PY
+
