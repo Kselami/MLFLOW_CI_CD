@@ -1,0 +1,57 @@
+name: train-mlflow
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start MLflow server (SQLite + artifacts)
+        run: |
+          nohup mlflow server --backend-store-uri sqlite:///mlflow.db             --artifacts-destination ./artifacts             --host 127.0.0.1 --port 5000 > mlflow_server.log 2>&1 &
+          sleep 5
+
+      - name: Run tests
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+        run: pytest -q
+
+      - name: Train and log model
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+        run: |
+          python src/train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier"             --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
+
+      - name: Show top runs
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+        run: |
+          python - <<'PY'
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          c = MlflowClient()
+          exps = {e.name: e.experiment_id for e in c.search_experiments()}
+          eid = exps.get("ci-experiment")
+          if eid:
+              runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
+              for r in runs:
+                  print(r.info.run_id, r.data.metrics.get("accuracy"))
+          else:
+              print("Experiment 'ci-experiment' not found")
+          PY

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+mlruns/
+artifacts/
+mlflow.db
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+.dist/
+build/
+dist/
+*.egg-info/
