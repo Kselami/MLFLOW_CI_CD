@@ -12,7 +12,6 @@ jobs:
       run:
         shell: powershell
     env:
-      # Valeurs par défaut (seront mises à jour après sélection dynamique du port)
       MLFLOW_TRACKING_URI: http://127.0.0.1:5000
       MLFLOW_DB_URI: sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db
       MLFLOW_ARTIFACTS_DIR: C:/mlflow-data/tp-mlflow-automation/artifacts
@@ -21,65 +20,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Résout un interpréteur Python fiable sur la machine (priorité au Python système)
-      - name: Resolve Python on runner
-        run: |
-          $py = $null
-          try {
-            $exe = & py -3 -c "import sys;print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $exe) { $py = $exe.Trim() }
-          } catch {}
-          if (-not $py) {
-            $cand = @(
-              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-              "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-              "C:\Python311\python.exe",
-              "C:\Python312\python.exe"
-            ) | Where-Object { Test-Path $_ }
-            if ($cand.Count -gt 0) { $py = $cand[0] }
-          }
-          if (-not $py) {
-            if ($env:PythonLocation) {
-              $py = Join-Path $env:PythonLocation 'python.exe'
-            }
-          }
-          if (-not $py -or -not (Test-Path $py)) {
-            throw "Aucun python fiable trouvé. Installe Python 3.11 sur le runner ou fournis un chemin."
-          }
-          "PY_EXE=$py" | Out-File -Append -FilePath $env:GITHUB_ENV
-          Write-Host "Using Python: $py"
-          & $py -c "import sys; print(sys.version); print(sys.executable)"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      # Bootstrap pip (sans Start-Process, erreurs visibles)
-      - name: Bootstrap pip (system python)
+      # Crée un venv local basé sur le Python d'actions (permissions OK + SSL OK)
+      - name: Create venv (from actions Python)
         run: |
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
-          $py = $env:PY_EXE
-          $pipOK = $true
-          try { & $py -m pip --version } catch { $pipOK = $false }
-          if (-not $pipOK) {
-            try {
-              & $py -m ensurepip --upgrade
-            } catch {
-              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-              $gp = "get-pip.py"
-              if (Test-Path $gp) { Remove-Item $gp -Force }
-              Invoke-WebRequest -UseBasicParsing -Uri https://bootstrap.pypa.io/get-pip.py -OutFile $gp -ErrorAction Stop
-              & $py $gp
-            }
-          }
-          & $py -m pip --version
-          & $py -m pip install --upgrade pip setuptools wheel
+          & "$env:PythonLocation\python.exe" -m venv .venv
+          $venv = Join-Path $env:GITHUB_WORKSPACE '.venv\Scripts\python.exe'
+          & $venv -c "import sys,ssl; print('PY:',sys.executable); print('SSL OK:',bool(ssl))"
+          "VENV_PY=$venv" | Out-File -Append -FilePath $env:GITHUB_ENV
 
-      - name: Install deps
+      - name: Install deps (in venv)
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
+          & $py -m pip install --upgrade pip setuptools wheel
           if (Test-Path requirements.txt) { & $py -m pip install -r requirements.txt }
           & $py -m pip install "mlflow>=2.8,<3" requests pytest
 
-      - name: Verify Python & mlflow
+      - name: Verify mlflow
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
           & $py -c "import sys, mlflow; print(sys.executable); print('mlflow', mlflow.__version__)"
 
       - name: Pick a free port and export MLFLOW_TRACKING_URI
@@ -94,9 +58,9 @@ jobs:
 
       - name: Ensure MLflow server running (robust)
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
 
-          # Dossiers
+          # Dossiers artefacts/DB
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
@@ -117,44 +81,30 @@ jobs:
             "--host","127.0.0.1","--port",$port
           )
 
-          # Démarrage direct (pas de Start-Process) pour récupérer le code si crash immédiat
-          $job = Start-Job -ScriptBlock {
-            param($py,$args,$out,$err)
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $py
-            $psi.Arguments = ($args -join ' ')
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError  = $true
-            $psi.UseShellExecute = $false
-            $p = New-Object System.Diagnostics.Process
-            $p.StartInfo = $psi
-            $null = $p.Start()
-            $p.StandardOutput.ReadToEnd() | Out-File -FilePath $out -Encoding utf8
-            $p.StandardError.ReadToEnd()  | Out-File -FilePath $err -Encoding utf8
-            $p.WaitForExit()
-            return $p.ExitCode
-          } -ArgumentList $py,$args,$out,$err
+          $proc = Start-Process -FilePath $py -ArgumentList $args `
+            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
+          "MLFLOW_SERVER_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV
+          Write-Host "MLflow server PID: $($proc.Id)  Port: $port  URI: $env:MLFLOW_TRACKING_URI"
 
-          # Attendre qu'il écoute/serve
+          # Attente jusqu'à 120s (port + HTTP)
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             try {
+              if ($proc.HasExited) { break }
               $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
               if ($tcp -and $tcp.State -in @('Listen','Established')) {
-                Invoke-WebRequest -Uri "http://127.0.0.1:$port" -TimeoutSec 2 | Out-Null
+                Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
                 $ok = $true; break
               }
             } catch {}
             Start-Sleep -Seconds 2
           }
-
           if (-not $ok) {
             Write-Host "=== mlflow-server.err (tail) ==="
             Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
             Write-Host "=== mlflow-server.out (tail) ==="
             Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-            $exit = Receive-Job $job -ErrorAction SilentlyContinue
-            Write-Host "mlflow server exit code (if finished): $exit"
+            try { Write-Host "Process exited: $($proc.HasExited) Code: $($proc.ExitCode)" } catch {}
             throw "MLflow server did not become ready on 127.0.0.1:$port"
           } else {
             Write-Host "MLflow is up on 127.0.0.1:$port"
@@ -162,7 +112,7 @@ jobs:
 
       - name: Smoke check MLflow (requests, retry)
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
           Set-Content -LiteralPath smoke.py -Value @'
           import os, time, requests
           url = os.environ["MLFLOW_TRACKING_URI"]
@@ -181,17 +131,17 @@ jobs:
 
       - name: Run tests
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
           & $py -m pytest -q
 
       - name: Train and log model (to your local MLflow)
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
           & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
 
       - name: Show top runs (from local MLflow)
         run: |
-          $py = $env:PY_EXE
+          $py = $env:VENV_PY
           Set-Content -LiteralPath show_runs.py -Value @'
           import os, mlflow
           from mlflow.tracking import MlflowClient
@@ -216,6 +166,7 @@ jobs:
           Get-Content -LiteralPath mlflow-server.err -Tail 200 -ErrorAction SilentlyContinue
           Write-Host "=== mlflow-server.out (tail) ==="
           Get-Content -LiteralPath mlflow-server.out -Tail 200 -ErrorAction SilentlyContinue
+
 
 
 
