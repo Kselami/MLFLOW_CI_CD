@@ -2,7 +2,7 @@ name: train-mlflow
 
 on:
   push:
-    branches: [ "main" ] # jdjdj 
+    branches: [ "main" ] # jdjdj jhf
   workflow_dispatch:
 
 jobs:
