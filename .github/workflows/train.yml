@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Crée un venv local basé sur le Python d'actions (permissions OK + SSL OK)
+      # Crée un venv local basé sur le Python d'actions (SSL OK)
       - name: Create venv (from actions Python)
         run: |
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
@@ -64,9 +64,13 @@ jobs:
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
-          # Windows path -> file:/// URI
-          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
-          $artUri = ($art -notmatch '^file:') ? ("file:///$art") : $art
+          # Windows path -> file:/// URI (sans opérateur ternaire)
+          $art  = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
+          if ($art -notmatch '^file:') {
+            $artUri = "file:///$art"
+          } else {
+            $artUri = $art
+          }
 
           $port = [int]$env:MLFLOW_PORT
           $out = "mlflow-server.out"
@@ -86,7 +90,7 @@ jobs:
           "MLFLOW_SERVER_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV
           Write-Host "MLflow server PID: $($proc.Id)  Port: $port  URI: $env:MLFLOW_TRACKING_URI"
 
-          # Attente jusqu'à 120s (port + HTTP)
+          # Attente jusqu'à 120s (port + HTTP) avec check de vie du process
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             try {
@@ -166,6 +170,7 @@ jobs:
           Get-Content -LiteralPath mlflow-server.err -Tail 200 -ErrorAction SilentlyContinue
           Write-Host "=== mlflow-server.out (tail) ==="
           Get-Content -LiteralPath mlflow-server.out -Tail 200 -ErrorAction SilentlyContinue
+
 
 
 
