@@ -8,7 +8,7 @@ on:
 jobs:
   train:
     # Le job tourne sur TON PC (self-hosted Windows)
-    runs-on: [self-hosted, windows]
+    runs-on: self-hosted
     env:
       # On pointe vers ton serveur local MLflow
       MLFLOW_TRACKING_URI: http://127.0.0.1:5000
