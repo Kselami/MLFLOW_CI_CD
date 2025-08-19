@@ -12,25 +12,23 @@ jobs:
       run:
         shell: powershell
     env:
-      MLFLOW_TRACKING_URI: http://127.0.0.1:5000
       MLFLOW_DB_URI: sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db
       MLFLOW_ARTIFACTS_DIR: C:/mlflow-data/tp-mlflow-automation/artifacts
+      MLFLOW_TRACKING_URI: http://127.0.0.1:5000
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Create venv (from actions Python)
+      - name: Create venv (from Actions Python)
         run: |
           Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
           & "$env:PythonLocation\python.exe" -m venv .venv
           $venv = Join-Path $env:GITHUB_WORKSPACE '.venv\Scripts\python.exe'
-          & $venv -c "import sys,ssl; print('PY:',sys.executable); print('SSL OK:',bool(ssl))"
+          & $venv -c "import sys,ssl; print('PY:', sys.executable); print('SSL OK:', bool(ssl))"
           "VENV_PY=$venv" | Out-File -Append -FilePath $env:GITHUB_ENV
 
       - name: Install deps (in venv)
@@ -45,19 +43,19 @@ jobs:
           $py = $env:VENV_PY
           & $py -c "import sys, mlflow; print(sys.executable); print('mlflow', mlflow.__version__)"
 
-      - name: Run pipeline end-to-end (start MLflow, smoke, tests, train, show, cleanup)
+      - name: E2E run (start mlflow, smoke, tests, train, show, cleanup)
         run: |
           $py = $env:VENV_PY
 
-          # --- Préparer artefacts/DB ---
+          # Prepare folders
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
-          # Chemin Windows -> URI file:///
-          $art  = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
+          # Windows path -> file:/// URI
+          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
           if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
 
-          # Choisir un port libre
+          # Pick free port
           $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
           $listener.Start()
           $port = ($listener.LocalEndpoint).Port
@@ -70,7 +68,7 @@ jobs:
           $err = "mlflow-server.err"
           Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
 
-          # Drapeaux serveur
+          # Start MLflow (keep process for the whole step)
           $args = @(
             "-m","mlflow","server",
             "--backend-store-uri",$env:MLFLOW_DB_URI,
@@ -78,16 +76,13 @@ jobs:
             "--artifacts-destination",$artUri,
             "--host","127.0.0.1","--port",$port
           )
-
-          # Démarrer MLflow et garder le process pendant toute la step
-          $proc = Start-Process -FilePath $py -ArgumentList $args `
-            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
+          $proc = Start-Process -FilePath $py -ArgumentList $args -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
           Write-Host "MLflow PID: $($proc.Id)"
 
           try {
-            # Attendre la disponibilité (port + HTTP)
+            # Wait for readiness (port + HTTP)
             $ok = $false
-            for ($i = 0; $i -lt 60; $i++) {
+            for ($i=0; $i -lt 60; $i++) {
               try {
                 if ($proc.HasExited) { break }
                 $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
@@ -99,67 +94,57 @@ jobs:
               Start-Sleep -Seconds 2
             }
             if (-not $ok) {
-              Write-Host "=== mlflow-server.err (tail) ==="
-              Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-              Write-Host "=== mlflow-server.out (tail) ==="
-              Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-              throw "MLflow server not ready"
+              Write-Host "=== mlflow-server.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+              Write-Host "=== mlflow-server.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+              throw "mlflow not ready"
             }
 
-            # --- Smoke (requests, retry léger) ---
-            Set-Content -LiteralPath smoke.py -Value @'
-            import os, time, requests
-            url = os.environ["MLFLOW_TRACKING_URI"]
-            for i in range(10):
-                try:
-                    r = requests.get(url, timeout=2)
-                    print("MLflow UI reachable:", r.status_code)
-                    break
-                except Exception as e:
-                    print("retry", i+1, ":", e)
-                    time.sleep(1.5)
-            else:
-                raise SystemExit("Smoke check failed")
-            '@
+            # --- Smoke (write file without here-strings) ---
+            @(
+              "import os, time, requests",
+              "url = os.environ['MLFLOW_TRACKING_URI']",
+              "for i in range(10):",
+              "    try:",
+              "        r = requests.get(url, timeout=2)",
+              "        print('MLflow UI reachable:', r.status_code)",
+              "        break",
+              "    except Exception as e:",
+              "        print('retry', i+1, ':', e)",
+              "        time.sleep(1.5)",
+              "else:",
+              "    raise SystemExit('Smoke check failed')"
+            ) | Set-Content -LiteralPath smoke.py -Encoding UTF8
             & $py smoke.py
 
             # --- Tests ---
             & $py -m pytest -q
 
-            # --- Entraînement ---
+            # --- Train ---
             & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.8
 
-            # --- Afficher top runs ---
-            Set-Content -LiteralPath show_runs.py -Value @'
-            import os, mlflow
-            from mlflow.tracking import MlflowClient
-
-            print("Tracking URI:", os.getenv("MLFLOW_TRACKING_URI"))
-            c = MlflowClient()
-            exps = {e.name: e.experiment_id for e in c.search_experiments()}
-            eid = exps.get("ci-experiment")
-            if eid:
-                runs = c.search_runs([eid], order_by=["metrics.accuracy DESC"], max_results=5)
-                for r in runs:
-                    print(r.info.run_id, r.data.metrics.get("accuracy"))
-            else:
-                print("Experiment 'ci-experiment' not found")
-            '@
+            # --- Show runs (write file without here-strings) ---
+            @(
+              "import os, mlflow",
+              "from mlflow.tracking import MlflowClient",
+              "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
+              "c = MlflowClient()",
+              "exps = {e.name: e.experiment_id for e in c.search_experiments()}",
+              "eid = exps.get('ci-experiment')",
+              "if eid:",
+              "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
+              "    for r in runs:",
+              "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
+              "else:",
+              "    print(\"Experiment 'ci-experiment' not found\")"
+            ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
             & $py show_runs.py
           }
           finally {
-            # Toujours montrer les logs et arrêter le serveur
-            Write-Host "=== mlflow-server.err (tail) ==="
-            Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-            Write-Host "=== mlflow-server.out (tail) ==="
-            Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-            try {
-              if ($proc -and -not $proc.HasExited) {
-                Stop-Process -Id $proc.Id -Force
-                Write-Host "MLflow server stopped."
-              }
-            } catch {}
+            Write-Host "=== mlflow-server.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+            Write-Host "=== mlflow-server.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+            try { if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Write-Host "MLflow server stopped."; } } catch {}
           }
+
 
 
 
