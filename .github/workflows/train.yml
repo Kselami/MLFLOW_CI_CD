@@ -12,8 +12,10 @@ jobs:
       run:
         shell: powershell
     env:
+      # Emplacements persistants
       MLFLOW_DB_URI: sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db
       MLFLOW_ARTIFACTS_DIR: C:/mlflow-data/tp-mlflow-automation/artifacts
+      # On travaille TOUJOURS avec le port fixe 5000
       MLFLOW_TRACKING_URI: http://127.0.0.1:5000
 
     steps:
@@ -38,127 +40,26 @@ jobs:
           if (Test-Path requirements.txt) { & $py -m pip install -r requirements.txt }
           & $py -m pip install "mlflow>=2.8,<3" requests pytest
 
-      - name: Verify mlflow
-        run: |
-          $py = $env:VENV_PY
-          & $py -c "import sys, mlflow; print(sys.executable); print('mlflow', mlflow.__version__)"
-
-      - name: E2E run (start mlflow, smoke, tests, train, show, cleanup)
+      # ⬇️ Démarre l'UI MLflow sur 5000 et ATTEND qu'elle réponde
+      - name: Ensure MLflow UI is running on port 5000 (persist & wait)
         run: |
           $py = $env:VENV_PY
 
-          # Prepare folders
+          # Dossiers
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
-          # Windows path -> file:/// URI
+          # file:/// URI
           $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
           if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
 
-          # Pick free port (ephemeral for CI step)
-          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-          $listener.Start()
-          $port = ($listener.LocalEndpoint).Port
-          $listener.Stop()
-          $env:MLFLOW_TRACKING_URI = "http://127.0.0.1:$port"
-          Write-Host "Using MLFLOW_TRACKING_URI=$($env:MLFLOW_TRACKING_URI)"
-
-          # Logs
-          $out = "mlflow-server.out"
-          $err = "mlflow-server.err"
+          # Logs dédiés UI
+          $out = "mlflow-ui-5000.out"
+          $err = "mlflow-ui-5000.err"
           Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
 
-          # Start MLflow (keep process for the whole step)
-          $args = @(
-            "-m","mlflow","server",
-            "--backend-store-uri",$env:MLFLOW_DB_URI,
-            "--serve-artifacts",
-            "--artifacts-destination",$artUri,
-            "--host","127.0.0.1","--port",$port
-          )
-          $proc = Start-Process -FilePath $py -ArgumentList $args -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
-          Write-Host "MLflow PID: $($proc.Id)"
-
-          try {
-            # Wait for readiness (port + HTTP)
-            $ok = $false
-            for ($i=0; $i -lt 60; $i++) {
-              try {
-                if ($proc.HasExited) { break }
-                $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-                if ($tcp -and $tcp.State -in @('Listen','Established')) {
-                  Invoke-WebRequest -UseBasicParsing -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
-                  $ok = $true; break
-                }
-              } catch {}
-              Start-Sleep -Seconds 2
-            }
-            if (-not $ok) {
-              Write-Host "=== mlflow-server.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-              Write-Host "=== mlflow-server.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-              throw "mlflow not ready"
-            }
-
-            # --- Smoke (no here-strings) ---
-            @(
-              "import os, time, requests",
-              "url = os.environ['MLFLOW_TRACKING_URI']",
-              "for i in range(10):",
-              "    try:",
-              "        r = requests.get(url, timeout=2)",
-              "        print('MLflow UI reachable:', r.status_code)",
-              "        break",
-              "    except Exception as e:",
-              "        print('retry', i+1, ':', e)",
-              "        time.sleep(1.5)",
-              "else:",
-              "    raise SystemExit('Smoke check failed')"
-            ) | Set-Content -LiteralPath smoke.py -Encoding UTF8
-            & $py smoke.py
-
-            # --- Tests ---
-            & $py -m pytest -q
-
-            # --- Train (NO accuracy constraint to fail the run) ---
-            & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.0
-
-            # --- Show runs (no here-strings) ---
-            @(
-              'import os, mlflow',
-              'from mlflow.tracking import MlflowClient',
-              "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
-              'c = MlflowClient()',
-              'exps = {e.name: e.experiment_id for e in c.search_experiments()}',
-              "eid = exps.get('ci-experiment')",
-              'if eid:',
-              "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
-              '    for r in runs:',
-              "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
-              'else:',
-              '    print("Experiment ''ci-experiment'' not found")'
-            ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
-            & $py show_runs.py
-          }
-          finally {
-            Write-Host "=== mlflow-server.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-            Write-Host "=== mlflow-server.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-            try { if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Write-Host "MLflow server stopped."; } } catch {}
-          }
-
-      - name: Launch MLflow UI on port 5000 (persist) & open browser
-        run: |
-          $py = $env:VENV_PY
+          # Démarre seulement si rien n'écoute déjà sur 5000
           $port = 5000
-
-          # Prepare folders
-          New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
-          New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
-
-          # Windows path -> file:/// URI
-          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
-          if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
-
-          # Start server only if port not already listening
           $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
           if (-not $tcp) {
             $args2 = @(
@@ -168,14 +69,77 @@ jobs:
               "--artifacts-destination",$artUri,
               "--host","127.0.0.1","--port",$port
             )
-            Start-Process -FilePath $py -ArgumentList $args2 -WindowStyle Hidden
-            Start-Sleep -Seconds 3
+            Start-Process -FilePath $py -ArgumentList $args2 `
+              -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
+            Start-Sleep -Seconds 2
           } else {
             Write-Host "MLflow UI already listening on port $port"
           }
 
-          # Open default browser to MLflow UI (on your self-hosted runner machine)
-          Start-Process "cmd.exe" "/c start http://127.0.0.1:$port"
+          # Attendre jusqu'à 30s que l'UI réponde
+          $ok = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port" -TimeoutSec 2 | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) {
+            Write-Host "=== mlflow-ui-5000.err (tail) ==="
+            Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
+            Write-Host "=== mlflow-ui-5000.out (tail) ==="
+            Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
+            throw "MLflow UI did not become ready on 127.0.0.1:$port"
+          } else {
+            Write-Host "MLflow UI is ready on http://127.0.0.1:$port"
+          }
+
+      # ⬇️ CI : smoke + tests + train + show (on NE redémarre plus de serveur)
+      - name: CI steps (smoke, tests, train, show)
+        run: |
+          $py = $env:VENV_PY
+
+          # Smoke
+          @(
+            'import os, requests',
+            "url = os.environ.get('MLFLOW_TRACKING_URI','http://127.0.0.1:5000')",
+            'r = requests.get(url, timeout=5)',
+            'print("MLflow UI reachable:", r.status_code)'
+          ) | Set-Content -LiteralPath smoke.py -Encoding UTF8
+          & $py smoke.py
+
+          # Tests
+          & $py -m pytest -q
+
+          # Train (pas de contrainte d’accuracy)
+          & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.0
+
+          # Show runs
+          @(
+            'import os, mlflow',
+            'from mlflow.tracking import MlflowClient',
+            "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
+            'c = MlflowClient()',
+            'exps = {e.name: e.experiment_id for e in c.search_experiments()}',
+            "eid = exps.get('ci-experiment')",
+            'if eid:',
+            "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
+            '    for r in runs:',
+            "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
+            'else:',
+            '    print("Experiment ''ci-experiment'' not found")'
+          ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
+          & $py show_runs.py
+
+      # ⬇️ Ouvre le navigateur uniquement si l'UI est répondante
+      - name: Open MLflow UI in browser
+        run: |
+          try {
+            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5000" -TimeoutSec 2 | Out-Null
+            Start-Process "cmd.exe" "/c start http://127.0.0.1:5000"
+          } catch {
+            Write-Host "UI not reachable now; open http://127.0.0.1:5000 manually."
+          }
 
 
 
