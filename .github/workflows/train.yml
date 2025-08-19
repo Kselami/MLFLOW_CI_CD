@@ -149,7 +149,7 @@ jobs:
             if (-not $keepServer) {
               try { if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Write-Host 'MLflow server stopped (failure).' } } catch {}
             } else {
-              Write-Host "MLflow server left running on 127.0.0.1:$port"
+              Write-Host "MLflow server left running on 127.0.0.1:$port"    ####
             }
           }
 
