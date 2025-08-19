@@ -87,7 +87,7 @@ jobs:
                 if ($proc.HasExited) { break }
                 $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
                 if ($tcp -and $tcp.State -in @('Listen','Established')) {
-                  Invoke-WebRequest -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
+                  Invoke-WebRequest -UseBasicParsing -Uri $env:MLFLOW_TRACKING_URI -TimeoutSec 2 | Out-Null
                   $ok = $true; break
                 }
               } catch {}
@@ -124,18 +124,18 @@ jobs:
 
             # --- Show runs (write file without here-strings) ---
             @(
-              "import os, mlflow",
-              "from mlflow.tracking import MlflowClient",
+              'import os, mlflow',
+              'from mlflow.tracking import MlflowClient',
               "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
-              "c = MlflowClient()",
-              "exps = {e.name: e.experiment_id for e in c.search_experiments()}",
+              'c = MlflowClient()',
+              'exps = {e.name: e.experiment_id for e in c.search_experiments()}',
               "eid = exps.get('ci-experiment')",
-              "if eid:",
+              'if eid:',
               "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
-              "    for r in runs:",
+              '    for r in runs:',
               "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
-              "else:",
-              "    print(\"Experiment 'ci-experiment' not found\")"
+              'else:',
+              '    print("Experiment ''ci-experiment'' not found")'
             ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
             & $py show_runs.py
           }
@@ -144,6 +144,7 @@ jobs:
             Write-Host "=== mlflow-server.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
             try { if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Write-Host "MLflow server stopped."; } } catch {}
           }
+
 
 
 
