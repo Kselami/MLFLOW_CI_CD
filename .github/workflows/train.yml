@@ -40,118 +40,103 @@ jobs:
           if (Test-Path requirements.txt) { & $py -m pip install -r requirements.txt }
           & $py -m pip install "mlflow>=2.8,<3" requests pytest
 
-      - name: Run pipeline on fixed port 5000 (start server, smoke, tests, train, show, open browser)
+      # Crée une tâche planifiée Windows (compte SYSTEM) qui lance l'UI MLflow sur 5000 et la garde vivante
+      - name: Ensure MLflow UI (Scheduled Task) is installed and running on port 5000
         run: |
           $py = $env:VENV_PY
           $port = 5000
 
-          # Prépare dossiers persistants
+          # Dossiers persistants
           New-Item -ItemType Directory -Force "C:\mlflow-data\tp-mlflow-automation" | Out-Null
           New-Item -ItemType Directory -Force "$env:MLFLOW_ARTIFACTS_DIR" | Out-Null
 
-          # file:/// URI pour les artefacts
-          $art = ($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/')
-          if ($art -notmatch '^file:') { $artUri = "file:///$art" } else { $artUri = $art }
+          # URI file:/// pour artefacts
+          $artUri = "file:///" + (($env:MLFLOW_ARTIFACTS_DIR -replace '\\','/'))
 
-          # Logs dédiés
-          $out = "mlflow-ui-5000.out"
-          $err = "mlflow-ui-5000.err"
-          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+          # Script PowerShell lancé par la tâche (pas de détachement, le process reste celui du serveur)
+          $venvPy = Join-Path $env:GITHUB_WORKSPACE '.venv\Scripts\python.exe'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'start-mlflow-ui.ps1'
+          $lines = @()
+          $lines += "$py = `"$venvPy`""
+          $lines += "$db = `"sqlite:///C:/mlflow-data/tp-mlflow-automation/mlflow.db`""
+          $lines += "$art = `"$artUri`""
+          $lines += "& $py -m mlflow server --backend-store-uri $db --serve-artifacts --artifacts-destination $art --host 127.0.0.1 --port $port"
+          $lines | Set-Content -LiteralPath $script -Encoding UTF8
 
-          # Si un autre process occupe 5000, on le tue
-          $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-          if ($conns) {
-            ($conns | Select-Object -ExpandProperty OwningProcess -Unique) | ForEach-Object {
-              try { Stop-Process -Id $_ -Force } catch {}
-            }
-            Start-Sleep -Seconds 1
+          # Arrête/supprime l'ancienne tâche si elle existe
+          schtasks /End /TN "MLflowUI-5000" 2>$null | Out-Null
+          schtasks /Delete /TN "MLflowUI-5000" /F 2>$null | Out-Null
+
+          # Crée la tâche sous SYSTEM, niveau élevé, au démarrage
+          $tr = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $script + '"'
+          schtasks /Create /TN "MLflowUI-5000" /RU "SYSTEM" /SC ONSTART /RL HIGHEST /TR "$tr" /F | Out-Null
+
+          # Lance maintenant
+          schtasks /Run /TN "MLflowUI-5000" | Out-Null
+          Start-Sleep -Seconds 2
+
+          # Attends que l'UI réponde
+          $ok = $false
+          for ($i=0; $i -lt 15; $i++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port" -TimeoutSec 2 | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) {
+            Write-Host "=== start-mlflow-ui.ps1 ==="
+            Get-Content -LiteralPath $script -ErrorAction SilentlyContinue
+            Write-Host "UI not reachable on 127.0.0.1:$port"
+            exit 1
+          } else {
+            Write-Host "MLflow UI is running on http://127.0.0.1:$port (scheduled task MLflowUI-5000)"
           }
 
-          # Démarre MLflow et GARDE le process pendant toute la step
-          $args = @(
-            "-m","mlflow","server",
-            "--backend-store-uri",$env:MLFLOW_DB_URI,
-            "--serve-artifacts",
-            "--artifacts-destination",$artUri,
-            "--host","127.0.0.1","--port",$port
-          )
-          $proc = Start-Process -FilePath $py -ArgumentList $args `
-                   -RedirectStandardOutput $out -RedirectStandardError $err `
-                   -WindowStyle Hidden -PassThru
-          Write-Host "MLflow PID: $($proc.Id)"
+      - name: Smoke, tests, train, show (uses the persistent UI on 5000)
+        run: |
+          $py = $env:VENV_PY
 
-          $keepServer = $false
+          # Smoke
+          @(
+            'import os, requests',
+            "url = os.environ.get('MLFLOW_TRACKING_URI','http://127.0.0.1:5000')",
+            'r = requests.get(url, timeout=5)',
+            'print("MLflow UI reachable:", r.status_code)'
+          ) | Set-Content -LiteralPath smoke.py -Encoding UTF8
+          & $py smoke.py
+
+          # Tests
+          & $py -m pytest -q
+
+          # Train (aucune contrainte d’accuracy qui ferait échouer le run)
+          & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.0
+
+          # Show runs
+          @(
+            'import os, mlflow',
+            'from mlflow.tracking import MlflowClient',
+            "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
+            'c = MlflowClient()',
+            'exps = {e.name: e.experiment_id for e in c.search_experiments()}',
+            "eid = exps.get('ci-experiment')",
+            'if eid:',
+            "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
+            '    for r in runs:',
+            "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
+            'else:',
+            '    print("Experiment ''ci-experiment'' not found")'
+          ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
+          & $py show_runs.py
+
+      - name: Open MLflow UI in browser
+        run: |
           try {
-            # Attendre la disponibilité (port + HTTP)
-            $ok = $false
-            for ($i=0; $i -lt 30; $i++) {
-              try {
-                if ($proc.HasExited) { break }
-                $tcp = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-                if ($tcp -and $tcp.State -in @('Listen','Established')) {
-                  Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port" -TimeoutSec 2 | Out-Null
-                  $ok = $true; break
-                }
-              } catch {}
-              Start-Sleep -Seconds 2
-            }
-            if (-not $ok) {
-              Write-Host "=== mlflow-ui-5000.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-              Write-Host "=== mlflow-ui-5000.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-              throw "MLflow UI did not become ready on 127.0.0.1:$port"
-            }
-
-            # Smoke
-            @(
-              'import os, requests',
-              "url = 'http://127.0.0.1:$port'",
-              'r = requests.get(url, timeout=5)',
-              'print("MLflow UI reachable:", r.status_code)'
-            ) | Set-Content -LiteralPath smoke.py -Encoding UTF8
-            & $py smoke.py
-
-            # Tests
-            & $py -m pytest -q
-
-            # Train (aucune contrainte d’accuracy qui ferait échouer le run)
-            & $py src\train.py --experiment-name "ci-experiment" --registered-model-name "IrisClassifier" --C 1.0 --max-iter 200 --seed 42 --min-accuracy 0.0
-
-            # Show runs
-            @(
-              'import os, mlflow',
-              'from mlflow.tracking import MlflowClient',
-              "os.environ['MLFLOW_TRACKING_URI'] = 'http://127.0.0.1:$port'",
-              "print('Tracking URI:', os.getenv('MLFLOW_TRACKING_URI'))",
-              'c = MlflowClient()',
-              'exps = {e.name: e.experiment_id for e in c.search_experiments()}',
-              "eid = exps.get('ci-experiment')",
-              'if eid:',
-              "    runs = c.search_runs([eid], order_by=['metrics.accuracy DESC'], max_results=5)",
-              '    for r in runs:',
-              "        print(r.info.run_id, r.data.metrics.get('accuracy'))",
-              'else:',
-              '    print("Experiment ''ci-experiment'' not found")'
-            ) | Set-Content -LiteralPath show_runs.py -Encoding UTF8
-            & $py show_runs.py
-
-            # Ouvre le navigateur et laisse le serveur tourner
-            Start-Process "cmd.exe" "/c start http://127.0.0.1:$port"
-            Start-Sleep -Seconds 3
-            $keepServer = $true
+            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5000" -TimeoutSec 2 | Out-Null
+            Start-Process "cmd.exe" "/c start http://127.0.0.1:5000"
+          } catch {
+            Write-Host "UI not reachable now; open http://127.0.0.1:5000 manually."
           }
-          catch {
-            Write-Host "Pipeline failed: $_"
-            throw
-          }
-          finally {
-            Write-Host "=== mlflow-ui-5000.err (tail) ==="; Get-Content -LiteralPath $err -Tail 200 -ErrorAction SilentlyContinue
-            Write-Host "=== mlflow-ui-5000.out (tail) ==="; Get-Content -LiteralPath $out -Tail 200 -ErrorAction SilentlyContinue
-            if (-not $keepServer) {
-              try { if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Write-Host 'MLflow server stopped (failure).' } } catch {}
-            } else {
-              Write-Host "MLflow server left running on 127.0.0.1:$port"    ####
-            }
-          }
+
 
 
 
